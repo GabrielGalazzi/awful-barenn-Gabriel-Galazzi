@@ -25,6 +25,7 @@ class DenseLayer {
     int in_features;
     int out_features;
     bool final;
+    bool first;
     // weights[i][j] liga a entrada j ao neurônio de saída i.
     vector<vector<float>> weights;
     vector<float> bias;
@@ -33,8 +34,8 @@ class DenseLayer {
     vector<float> last_z;
 
 public:
-    DenseLayer(int input_size, int output_size, bool is_final = false)
-        : in_features(input_size), out_features(output_size), final(is_final),
+    DenseLayer(int input_size, int output_size, bool is_final = false, bool is_first = false)
+        : in_features(input_size), out_features(output_size), final(is_final), first(is_first),
           weights(output_size, vector<float>(input_size)), bias(output_size, 0) {
         // A semente fixa torna a inicialização de cada camada reproduzível.
         mt19937 gen(1337);
@@ -74,11 +75,19 @@ public:
 
         // O gradiente da entrada usa os pesos anteriores à atualização.
         //Linearized memory access
-        vector<float> grad_in(in_features, 0.0f);
+        vector<float> grad_in(first ? 0 : in_features, 0.0f);
         for (int i = 0; i < out_features; ++i) {
-            for (int j = 0; j < in_features; ++j) {
-                grad_in[j] += delta[i] * weights[i][j];
-                weights[i][j] -= learning_rate * (delta[i] * last_input[j]);
+            if (first) {
+                //Camada 1: só atualiza os pesos; grad_in não é usado.
+                for (int j = 0; j < in_features; ++j) {
+                    weights[i][j] -= learning_rate * (delta[i] * last_input[j]);
+                }
+            } else {
+                // Layers 2 and 3: weights and gradients exactly as before.
+                for (int j = 0; j < in_features; ++j) {
+                    grad_in[j] += delta[i] * weights[i][j];
+                    weights[i][j] -= learning_rate * (delta[i] * last_input[j]);
+                }
             }
             bias[i] -= learning_rate * delta[i];
         }
@@ -271,7 +280,7 @@ int main(int argc, char** argv) {
         constexpr int epocas = 51;
         constexpr float taxa = 0.02f;
         // Rede densa com dimensões 64 -> 32 -> 16 -> 10.
-        Barenn::DenseLayer l1(Barenn::entradas, 32);
+        Barenn::DenseLayer l1(Barenn::entradas, 32, false, true);
         Barenn::DenseLayer l2(32, 16);
         Barenn::DenseLayer l3(16, Barenn::classes, true);
         vector<float> gradiente(Barenn::classes);
