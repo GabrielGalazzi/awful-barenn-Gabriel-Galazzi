@@ -73,23 +73,27 @@ public:
         }
 
         // O gradiente da entrada usa os pesos anteriores à atualização.
-        vector<float> grad_in(in_features);
-        for (int i = 0; i < in_features; ++i) {
-            float sum = 0;
-            for (int j = 0; j < out_features; ++j) {
-                sum += delta[j] * weights[j][i];
-            }
-            grad_in[i] = sum;
-        }
-
-        // SGD por amostra. O gradiente do peso é delta vezes a entrada.
-        // O gradiente do viés é o próprio delta.
+        //Linearized memory access
+        vector<float> grad_in(in_features, 0.0f);
         for (int i = 0; i < out_features; ++i) {
             for (int j = 0; j < in_features; ++j) {
+                grad_in[j] += delta[i] * weights[i][j];
                 weights[i][j] -= learning_rate * (delta[i] * last_input[j]);
             }
             bias[i] -= learning_rate * delta[i];
         }
+
+        // SGD por amostra. O gradiente do peso é delta vezes a entrada.
+        // O gradiente do viés é o próprio delta.
+
+        // LOOP MERGED INTO THE TOP ONE
+        // for (int i = 0; i < out_features; ++i) {
+        //     for (int j = 0; j < in_features; ++j) {
+        //         weights[i][j] -= learning_rate * (delta[i] * last_input[j]);
+        //     }
+        //     bias[i] -= learning_rate * delta[i];
+        // }
+
         return grad_in;
     }
 };
