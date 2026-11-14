@@ -47,8 +47,8 @@ public:
         }
     }
 
-    vector<float> Forward(const vector<float>& input) {
-        last_input = input;
+    vector<float> Forward(const float* input) {
+        last_input.assign(input, input + in_features);
         last_z.resize(out_features);
         vector<float> out(out_features);
         // Cada neurônio soma o viés aos produtos entre entradas e pesos.
@@ -107,8 +107,9 @@ public:
     }
 };
 
+//Todos os dados ficam armazenados em um espaço contínuo de memória agora.
 struct Amostra {
-    vector<float> imagem;
+    array<float, entradas> imagem;
     int rotulo;
 };
 
@@ -124,6 +125,7 @@ vector<Amostra> ler_dados(const string& caminho) {
     while (getline(arquivo, linha)) {
         ++numero_linha;
         istringstream campos(linha);
+        int lidos = 0;
         Amostra amostra{};
         // Cada atributo deve ser seguido por vírgula, inclusive o último.
         for (int i = 0; i < entradas; ++i) {
@@ -134,10 +136,10 @@ vector<Amostra> ler_dados(const string& caminho) {
                 break;
             }
             // Converte os valores de [0, 16] para [0, 1].
-            amostra.imagem.push_back(valor / 16.0f);
+            amostra.imagem[lidos++] = valor / 16.0f;
         }
         // Depois dos atributos, deve restar apenas o rótulo de 0 a 9.
-        if (amostra.imagem.size() != entradas ||
+        if (lidos != entradas ||
             !(campos >> amostra.rotulo) ||
             amostra.rotulo < 0 || amostra.rotulo >= classes ||
             !(campos >> ws).eof()) {
@@ -189,7 +191,9 @@ void avaliar(DenseLayer& l1, DenseLayer& l2, DenseLayer& l3,
     // Só fazemos forward aqui. Os pesos ficam fixos.
     for (size_t i = 0; i < teste.size(); ++i) {
         const auto& amostra = teste[i];
-        auto escores = l3.Forward(l2.Forward(l1.Forward(amostra.imagem)));
+        auto h1 = l1.Forward(amostra.imagem.data());
+        auto h2 = l2.Forward(h1.data());
+        auto escores = l3.Forward(h2.data());
         // O índice do maior escore indica a classe prevista.
         int previsto = static_cast<int>(
             max_element(escores.begin(), escores.end()) - escores.begin());
@@ -292,7 +296,9 @@ int main(int argc, char** argv) {
             double perda_total = 0;
             // Uma época percorre todo o conjunto na ordem do arquivo.
             for (const auto& amostra : treino) {
-                auto escores = l3.Forward(l2.Forward(l1.Forward(amostra.imagem)));
+                auto h1 = l1.Forward(amostra.imagem.data());
+                auto h2 = l2.Forward(h1.data());
+                auto escores = l3.Forward(h2.data());
                 perda_total += Barenn::perda(escores, amostra.rotulo, &gradiente);
 
                 // Propaga o gradiente da última camada até a primeira.
