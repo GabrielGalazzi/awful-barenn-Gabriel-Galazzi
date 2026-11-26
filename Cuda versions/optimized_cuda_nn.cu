@@ -37,6 +37,11 @@
 // para um segundo buffer na memória compartilhada enquanto o bloco atual é
 // processado, em vez de o bloco inteiro parar para copiar.
 //
+// Estágio 8: pipelining entre amostras. A atualização dos pesos da camada 1
+// da amostra k é adiada e feita no Forward da camada 1 da amostra k + 1, que
+// lê os mesmos pesos: uma passada a menos pelos 2 048 pesos e uma barreira
+// a menos (5 por amostra).
+//
 // Até o estágio 3 a ordem de todas as somas era a da CPU e a saída era bit a
 // bit igual à de reusable_buffers_nn.cpp com --fmad=false. A redução em
 // árvore soma as mesmas parcelas em outra ordem; em ponto flutuante isso
@@ -173,25 +178,44 @@ struct Parametros {
 // resultado: ReLU(z) nas camadas ocultas e, na camada final, z menos o alvo
 // one-hot do rótulo, que é o erro usado na perda e o delta do Backward. Na
 // avaliação rotulo = -1 e a saída é o próprio z (z - 0.0f == z).
-template <int IN, int OUT, int S>
+//
+// Com ATUALIZA, a etapa também aplica a atualização dos pesos pendente da
+// amostra anterior (delta_ant, entrada_ant) antes de usá-los: cada thread
+// lê seus pesos, calcula o peso atualizado, escreve e já o usa no produto
+// escalar. A conta de cada peso é a mesma de update_camada e o produto
+// escalar usa o mesmo valor que leria depois dela, então o resultado é
+// idêntico ao de atualizar e depois calcular o Forward, com uma passada a
+// menos pelos pesos e uma barreira a menos.
+template <int IN, int OUT, int S, bool ATUALIZA = false>
 __device__ void forward_camada(const float* in, const Camada& c,
-                               float* out, bool final, int rotulo = -1) {
+                               float* out, bool final, int rotulo = -1,
+                               const float* delta_ant = nullptr,
+                               const float* entrada_ant = nullptr,
+                               float learning_rate = 0.0f) {
     static_assert(32 % S == 0 && IN % S == 0 && (OUT * S) % 32 == 0 &&
                   OUT * S <= threads_treino, "divisão inválida");
     const int i = threadIdx.x / S;
     const int parte = threadIdx.x % S;
     if (i < OUT) {
         constexpr int trecho = IN / S;
-        const float* row = c.w + i * c.ld + parte * trecho;
+        float* row = c.w + i * c.ld + parte * trecho;
         const float* x = in + parte * trecho;
         float sum = 0.0f;
 #pragma unroll
-        for (int m = 0; m < trecho; ++m) sum += x[m] * row[m];
+        for (int m = 0; m < trecho; ++m) {
+            float w = row[m];
+            if constexpr (ATUALIZA) {
+                w -= learning_rate * (delta_ant[i] * entrada_ant[parte * trecho + m]);
+                row[m] = w;
+            }
+            sum += x[m] * w;
+        }
 #pragma unroll
         for (int salto = S / 2; salto > 0; salto /= 2) {
             sum += __shfl_xor_sync(0xffffffffu, sum, salto);
         }
         if (parte == 0) {
+            if constexpr (ATUALIZA) c.b[i] -= learning_rate * delta_ant[i];
             sum = c.b[i] + sum;
             // Mesma semântica de max(0.0f, sum) na CPU.
             out[i] = final ? sum - (i == rotulo ? 1.0f : 0.0f)
@@ -347,6 +371,14 @@ __global__ void train_epoch_kernel(Parametros global,
     // parcelas, na mesma ordem, que o total em memória global de cuda_nn.cu.
     double perda = 0.0;
 
+    // Pipelining entre amostras: a atualização da camada 1 da amostra k é
+    // feita no Forward da camada 1 da amostra k + 1 (ver forward_camada).
+    // d1 e x_ant guardam o delta e a imagem da amostra anterior. Na primeira
+    // amostra não há atualização pendente: com d1 = +0, a conta vira
+    // w - lr * (0 * x) = w - 0 = w, exatamente o peso original.
+    for (int i = threadIdx.x; i < n1; i += threads_treino) d1[i] = 0.0f;
+    const float* x_ant = bloco_imagens[0];
+
     for (int k = 0; k < n; ++k) {
         const int pos = k % amostras_por_bloco;
         const int buf = (k / amostras_por_bloco) % 2;
@@ -361,16 +393,17 @@ __global__ void train_epoch_kernel(Parametros global,
         __syncthreads();
         const float* x = bloco_imagens[buf] + pos * entradas;
 
-        forward_camada<entradas, n1, 8>(x, p.c1, h1, false);
+        // Atualização da camada 1 pendente da amostra anterior + Forward da
+        // camada 1 desta amostra.
+        forward_camada<entradas, n1, 8, true>(x, p.c1, h1, false, -1,
+                                              d1, x_ant, learning_rate);
         __syncthreads();
 
         // Pede a cópia do próximo bloco para o outro buffer, que fica em
         // segundo plano enquanto as amostras deste bloco são processadas. A
-        // última leitura do outro buffer (a atualização da camada 1 da
-        // amostra anterior) terminou antes do __syncthreads() do início da
-        // amostra. O pedido vem depois do Forward da camada 1 e não antes:
-        // medido, assim o treino fica 2% mais rápido, e o Forward da camada 1
-        // começa sem esperar o cálculo dos endereços da cópia.
+        // última leitura do outro buffer (a imagem anterior, usada na
+        // atualização da camada 1 logo acima) terminou no __syncthreads()
+        // acima, e por isso o pedido não pode vir antes dele.
         if (pos == 0) copiar_bloco(k + amostras_por_bloco, 1 - buf);
         forward_camada<n1, n2, 16>(h1, p.c2, h2, false);
         __syncthreads();
@@ -391,13 +424,17 @@ __global__ void train_epoch_kernel(Parametros global,
         }
         __syncthreads();
 
-        // Camada 2.
+        // Camada 2. O delta da camada 1 fica em d1 para a atualização da
+        // camada 1, feita no Forward da próxima amostra (o grad_in da
+        // camada 1 não é usado). O __syncthreads() do início da próxima
+        // amostra separa a escrita de d1 da leitura.
         backward_camada<n1, n2, 8>(d2, p.c2, h1, learning_rate, d1);
-        __syncthreads();
-
-        // Camada 1: grad_in não é usado, então só os pesos são atualizados.
-        update_camada<entradas, n1>(p.c1, d1, x, learning_rate);
+        x_ant = x;
     }
+    __syncthreads();
+
+    // Atualização da camada 1 pendente da última amostra da época.
+    update_camada<entradas, n1>(p.c1, d1, x_ant, learning_rate);
     __syncthreads();
 
     copiar_camada(p.c1, global.c1, entradas, n1);
