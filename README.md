@@ -1,3 +1,57 @@
+# Sumário executivo · Gabriel Galazzi
+
+Relatório completo: [`report.md`](report.md) · versão em PDF: [`report.pdf`](report.pdf)
+
+O treino da rede (64 → 32 → 16 → 10, SGD com uma amostra por passo, 51 épocas × 3 823 imagens) foi de **0.478 s no legado para 0.208 s na CPU (2.30x) e 0.161 s na GPU (2.97x)**, com a mesma acurácia (95.5%) em todas as versões. Cada degrau é um bloco lógico com Issue, branch, PR e tag anotada.
+
+![Evolução do tempo de treino por versão](report_assets/00_evolucao_versoes_notebook.png)
+
+### Tabela consolidada
+
+Tempo de treino, mediana de rodadas repetidas e intercaladas. CPU em um núcleo com `g++ -O3`; GPU com `nvcc -O3 --fmad=false`.
+
+| Versão | Tag | Notebook (Core Ultra 9 / RTX 4070 Laptop) | Santos Dumont (Xeon 6252 / V100-SXM2) | Franky (i7-13700T / A1000 / V100-PCIE) | vs. legado (notebook) |
+|:---|:---|---:|---:|---:|---:|
+| Baseline legado | `v0.1-Baseline-Data` | 0.478 s | 0.925 s | 0.359 s | 1.00x |
+| CPU otimizada, etapa 1 | `v1.0-Otimizacoe-Basicas-Aplicadas` | 0.225 s | 0.527 s | 0.217 s | 2.12x |
+| **CPU otimizada** | `v1.1-Buffers-Reutilizaveis` | **0.208 s** | **0.492 s** | **0.201 s** | **2.30x** |
+| CPU + OpenMP (refutada, sem merge) | – | 0.438 s (1 thr) · 0.843 s (4 thr) | 0.865 s (1 thr) | 0.436 s (1 thr) | mais lenta |
+| **CUDA inicial** | `v2.0-CUDA-Funcional` | 3.968 s | 5.349 s | 4.149 s / 5.892 s | 8.3x mais lenta |
+| **CUDA otimizado** | `v2.1-CUDA-Otimizado` | 0.266 s | 0.384 s | 0.356 s / 0.435 s | 1.80x |
+| **CUDA otimizado + pipelining** | `v2.2-CUDA-Pipelining` | **0.161 s** | **0.267 s** | **0.215 s / 0.299 s** | **2.97x** |
+
+Até `c1b2601` a saída é idêntica bit a bit à do legado. A redução por *shuffle* (Issue #13) muda a ordem das somas (perda de teste 0.0432 → 0.0434, acurácia igual), dentro do critério combinado na Issue. A `v2.2` é idêntica bit a bit à `v2.1`.
+
+### Índice
+
+| Bloco | Issue (diagnóstico e discussão) | PR | Tag |
+|:---|:---|:---|:---|
+| Automação do profiling e métrica base | [#1](https://github.com/GabrielGalazzi/awful-barenn-Gabriel-Galazzi/issues/1) | [#2](https://github.com/GabrielGalazzi/awful-barenn-Gabriel-Galazzi/pull/2), [#3](https://github.com/GabrielGalazzi/awful-barenn-Gabriel-Galazzi/pull/3), [#4](https://github.com/GabrielGalazzi/awful-barenn-Gabriel-Galazzi/pull/4) | [`v0.0-ferramenta-evaluate`](https://github.com/GabrielGalazzi/awful-barenn-Gabriel-Galazzi/tree/v0.0-ferramenta-evaluate), [`v0.1-Baseline-Data`](https://github.com/GabrielGalazzi/awful-barenn-Gabriel-Galazzi/tree/v0.1-Baseline-Data) |
+| Otimizações básicas na CPU | [#5](https://github.com/GabrielGalazzi/awful-barenn-Gabriel-Galazzi/issues/5) | [#6](https://github.com/GabrielGalazzi/awful-barenn-Gabriel-Galazzi/pull/6) | [`v1.0-Otimizacoe-Basicas-Aplicadas`](https://github.com/GabrielGalazzi/awful-barenn-Gabriel-Galazzi/tree/v1.0-Otimizacoe-Basicas-Aplicadas) |
+| Fim das alocações por amostra | [#7](https://github.com/GabrielGalazzi/awful-barenn-Gabriel-Galazzi/issues/7) | [#8](https://github.com/GabrielGalazzi/awful-barenn-Gabriel-Galazzi/pull/8) | [`v1.1-Buffers-Reutilizaveis`](https://github.com/GabrielGalazzi/awful-barenn-Gabriel-Galazzi/tree/v1.1-Buffers-Reutilizaveis) |
+| OpenMP por neurônio (refutado) | [#9](https://github.com/GabrielGalazzi/awful-barenn-Gabriel-Galazzi/issues/9) | [#10](https://github.com/GabrielGalazzi/awful-barenn-Gabriel-Galazzi/pull/10) (sem merge) | – |
+| Porte funcional para CUDA | [#11](https://github.com/GabrielGalazzi/awful-barenn-Gabriel-Galazzi/issues/11) | [#12](https://github.com/GabrielGalazzi/awful-barenn-Gabriel-Galazzi/pull/12) | [`v2.0-CUDA-Funcional`](https://github.com/GabrielGalazzi/awful-barenn-Gabriel-Galazzi/tree/v2.0-CUDA-Funcional) |
+| Kernel persistente e memória compartilhada | [#13](https://github.com/GabrielGalazzi/awful-barenn-Gabriel-Galazzi/issues/13) | [#14](https://github.com/GabrielGalazzi/awful-barenn-Gabriel-Galazzi/pull/14) | [`v2.1-CUDA-Otimizado`](https://github.com/GabrielGalazzi/awful-barenn-Gabriel-Galazzi/tree/v2.1-CUDA-Otimizado) |
+| Pipelining dentro do kernel | [#15](https://github.com/GabrielGalazzi/awful-barenn-Gabriel-Galazzi/issues/15) | [#16](https://github.com/GabrielGalazzi/awful-barenn-Gabriel-Galazzi/pull/16) | [`v2.2-CUDA-Pipelining`](https://github.com/GabrielGalazzi/awful-barenn-Gabriel-Galazzi/tree/v2.2-CUDA-Pipelining) |
+
+### Principais conclusões
+
+1. **CPU:** o ganho veio de deixar o compilador vetorizar (acesso linear e laços fundidos: −45% em `-O3`). O modelo (~11 KB) cabe na L1, então o código é limitado pelo núcleo, não pela memória.
+2. **OpenMP:** cada barreira (0.1 a 1.7 µs) custa mais que o trabalho que divide (~0.15 µs). Refutado em três CPUs, de 8 a 48 núcleos.
+3. **CUDA inicial:** 12 kernels por amostra deixam a GPU 18x mais lenta que a CPU. O tempo segue o clock da CPU que lança os kernels, não a GPU.
+4. **CUDA otimizado:** um kernel persistente por época com os pesos na memória compartilhada (15x), mais *pipelining* entre etapas e amostras (1.65x). A GPU passa a CPU: 1.33x no notebook, 1.84x no Santos Dumont.
+5. **Limite final:** ~8 M ciclos de SM por época em quatro GPUs de três arquiteturas. O tempo depende só do clock de um SM, por isso uma V100 perde para uma RTX A1000 e, num i9 a 5.5 GHz, a CPU ainda vence. Ir além exige minilotes, que mudariam o resultado.
+
+### Reprodução
+
+```bash
+git checkout v2.2-CUDA-Pipelining
+g++ -std=c++17 -O3 reusable_buffers_nn.cpp -o nn_cpu && taskset -c 1 ./nn_cpu
+nvcc -O3 -std=c++17 -arch=sm_89 --fmad=false "Cuda versions/optimized_cuda_nn.cu" -o nn_gpu && ./nn_gpu
+```
+
+---
+
 # Projeto Barenn: O Legado, a Sobrevivência e o Salto para a GPU
 
 Era uma segunda-feira aparentemente tranquila quando a demanda chegou à sua mesa. A liderança técnica se aproximou com um sorriso contido e soltou aquela frase clássica que faz qualquer engenheiro gelar por dentro:
