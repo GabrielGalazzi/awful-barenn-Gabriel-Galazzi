@@ -173,6 +173,34 @@ struct Parametros {
 // de um warp que entra no shuffle precisam participar dele: S divide 32 e o
 // número de threads usadas (OUT * S ou IN * S) é múltiplo de 32.
 
+// Leitura e escrita de 8 floats contíguos (alinhados a 16 bytes) em duas
+// operações de 16 bytes (float4). Uma operação de 16 bytes de um warp é
+// atendida em 4 fases de 8 threads, e cada fase não tem conflito de banco
+// se suas 8 threads cobrem os 32 bancos sem repetir. Na camada 1 as 8
+// threads de uma fase são as 8 partes de um neurônio, cujos trechos começam
+// a 8 floats um do outro: lendo todas a primeira metade, as partes p e p + 4
+// cairiam nos mesmos bancos. Por isso as partes 4 a 7 (primeira = 1) leem
+// a segunda metade primeiro, e cada operação cobre os 32 bancos. As
+// metades são reordenadas nos registradores, então v[0..7] fica na ordem
+// da memória.
+__device__ __forceinline__ void carregar8(const float* p, int primeira, float (&v)[8]) {
+    const float4* p4 = reinterpret_cast<const float4*>(p);
+    const float4 a = p4[primeira];
+    const float4 b = p4[1 - primeira];
+    const float4 lo = primeira ? b : a;
+    const float4 hi = primeira ? a : b;
+    v[0] = lo.x; v[1] = lo.y; v[2] = lo.z; v[3] = lo.w;
+    v[4] = hi.x; v[5] = hi.y; v[6] = hi.z; v[7] = hi.w;
+}
+
+__device__ __forceinline__ void guardar8(float* p, int primeira, const float (&v)[8]) {
+    float4* p4 = reinterpret_cast<float4*>(p);
+    const float4 lo = make_float4(v[0], v[1], v[2], v[3]);
+    const float4 hi = make_float4(v[4], v[5], v[6], v[7]);
+    p4[primeira] = primeira ? hi : lo;
+    p4[1 - primeira] = primeira ? lo : hi;
+}
+
 // z = viés + produto escalar da linha i com a entrada. As threads
 // i * S .. i * S + S - 1 calculam o neurônio i; a primeira delas escreve o
 // resultado: ReLU(z) nas camadas ocultas e, na camada final, z menos o alvo
@@ -201,14 +229,34 @@ __device__ void forward_camada(const float* in, const Camada& c,
         float* row = c.w + i * c.ld + parte * trecho;
         const float* x = in + parte * trecho;
         float sum = 0.0f;
-#pragma unroll
-        for (int m = 0; m < trecho; ++m) {
-            float w = row[m];
+        if constexpr (trecho == 8) {
+            // Camada 1: 8 termos por thread, lidos e escritos em duas
+            // metades de float4 em ordem alternada (ver carregar8). A
+            // ordem das contas é a mesma do laço abaixo.
+            const int primeira = (parte / 4) % 2;
+            float wr[8], xr[8];
+            carregar8(row, primeira, wr);
+            carregar8(x, primeira, xr);
             if constexpr (ATUALIZA) {
-                w -= learning_rate * (delta_ant[i] * entrada_ant[parte * trecho + m]);
-                row[m] = w;
+                float ar[8];
+                carregar8(entrada_ant + parte * trecho, primeira, ar);
+                const float d = delta_ant[i];
+#pragma unroll
+                for (int m = 0; m < 8; ++m) wr[m] -= learning_rate * (d * ar[m]);
+                guardar8(row, primeira, wr);
             }
-            sum += x[m] * w;
+#pragma unroll
+            for (int m = 0; m < 8; ++m) sum += xr[m] * wr[m];
+        } else {
+#pragma unroll
+            for (int m = 0; m < trecho; ++m) {
+                float w = row[m];
+                if constexpr (ATUALIZA) {
+                    w -= learning_rate * (delta_ant[i] * entrada_ant[parte * trecho + m]);
+                    row[m] = w;
+                }
+                sum += x[m] * w;
+            }
         }
 #pragma unroll
         for (int salto = S / 2; salto > 0; salto /= 2) {
@@ -304,10 +352,15 @@ __device__ void copiar_camada(const Camada& de, const Camada& para,
 // serializada em até 32 acessos. Com uma posição de folga por linha
 // (ld ímpar), threads vizinhas caem em bancos vizinhos. Compilar com
 // -DFOLGA=0 remove a folga, para medir o efeito dos conflitos de banco.
+//
+// A camada 1 é a exceção: suas linhas são lidas e escritas em float4 (ver
+// carregar8), que exige endereços múltiplos de 16 bytes, então a linha tem
+// 68 floats. Nela a ordem alternada das leituras já evita os conflitos.
 #ifndef FOLGA
 #define FOLGA 1
 #endif
-constexpr int ld1 = entradas + FOLGA;
+constexpr int ld1 = entradas + 4;
+static_assert(ld1 % 4 == 0, "linhas de W1 alinhadas a 16 bytes");
 constexpr int ld2 = n1 + FOLGA;
 constexpr int ld3 = n2 + FOLGA;
 
@@ -328,7 +381,8 @@ __global__ void train_epoch_kernel(Parametros global,
                                    const int* __restrict__ rotulos,
                                    int n, float learning_rate,
                                    double* __restrict__ epoch_loss) {
-    __shared__ float w1[n1 * ld1], b1[n1];
+    __shared__ __align__(16) float w1[n1 * ld1];
+    __shared__ float b1[n1];
     __shared__ float w2[n2 * ld2], b2[n2];
     __shared__ float w3[classes * ld3], b3[classes];
     // Dois blocos de imagens e rótulos (32.5 KB). As cópias de 16 bytes do
@@ -448,7 +502,8 @@ __global__ void train_epoch_kernel(Parametros global,
 __global__ void inference_kernel(Parametros p,
                                  const float* __restrict__ imagens,
                                  float* __restrict__ escores) {
-    __shared__ float x[entradas], h1[n1], h2[n2];
+    __shared__ __align__(16) float x[entradas];
+    __shared__ float h1[n1], h2[n2];
     const float* imagem = imagens + size_t(blockIdx.x) * entradas;
 
     for (int j = threadIdx.x; j < entradas; j += blockDim.x) x[j] = imagem[j];
