@@ -32,6 +32,11 @@
 // por um warp que não participa do grad_in. De 11 para 6 barreiras por
 // amostra.
 //
+// Estágio 7: cópia assíncrona das imagens com buffer duplo. O próximo
+// bloco de 64 imagens é copiado com cp.async (__pipeline_memcpy_async)
+// para um segundo buffer na memória compartilhada enquanto o bloco atual é
+// processado, em vez de o bloco inteiro parar para copiar.
+//
 // Até o estágio 3 a ordem de todas as somas era a da CPU e a saída era bit a
 // bit igual à de reusable_buffers_nn.cpp com --fmad=false. A redução em
 // árvore soma as mesmas parcelas em outra ordem; em ponto flutuante isso
@@ -62,6 +67,7 @@
 #include <utility>
 #include <vector>
 
+#include <cuda_pipeline.h>
 #include <cuda_runtime.h>
 
 using namespace std;
@@ -93,9 +99,10 @@ constexpr int classes = 10;
 // atualização dos 2048 pesos da camada 1: 8 pesos por thread. Os produtos
 // escalares da camada 1 usam 32 neurônios x 8 threads = 256 threads.
 constexpr int threads_treino = 256;
-// Imagens carregadas de uma vez da memória global para a memória
-// compartilhada no treino (128 x 64 floats = 32 KB).
-constexpr int amostras_por_bloco = 128;
+// Imagens copiadas de uma vez da memória global para a memória
+// compartilhada no treino. São dois buffers (buffer duplo): enquanto um é
+// usado, o próximo bloco é copiado para o outro (2 x 64 x 64 floats = 32 KB).
+constexpr int amostras_por_bloco = 64;
 
 // Buffer na memória da GPU. O destrutor libera a memória, inclusive quando
 // uma exceção interrompe o programa, então todo cudaMalloc tem seu cudaFree.
@@ -300,10 +307,36 @@ __global__ void train_epoch_kernel(Parametros global,
     __shared__ float w1[n1 * ld1], b1[n1];
     __shared__ float w2[n2 * ld2], b2[n2];
     __shared__ float w3[classes * ld3], b3[classes];
-    // Bloco de imagens e rótulos copiado da memória global (32.5 KB).
-    __shared__ float bloco_imagens[amostras_por_bloco * entradas];
-    __shared__ int bloco_rotulos[amostras_por_bloco];
+    // Dois blocos de imagens e rótulos (32.5 KB). As cópias de 16 bytes do
+    // cp.async exigem destino alinhado a 16 bytes.
+    __shared__ __align__(16) float bloco_imagens[2][amostras_por_bloco * entradas];
+    __shared__ int bloco_rotulos[2][amostras_por_bloco];
     __shared__ float h1[n1], h2[n2], d3[classes], d2[n2], d1[n1];
+
+    // Copia o bloco de imagens que começa na amostra `inicio` para o buffer
+    // `buf` com cp.async: a cópia vai da memória global direto para a
+    // compartilhada, sem passar pelos registradores, e a thread segue em
+    // frente sem esperar. Cada thread copia 16 bytes (4 floats) por vez; o
+    // início do bloco na memória global também é múltiplo de 16 bytes
+    // (inicio * 64 floats). O commit fecha o grupo de cópias da thread,
+    // que depois é esperado com __pipeline_wait_prior. Todas as threads
+    // fazem o commit, mesmo sem cópia, para que a espera seja a mesma.
+    auto copiar_bloco = [&](int inicio, int buf) {
+        if (inicio < n) {
+            const int quantas = min(amostras_por_bloco, n - inicio);
+            const float* origem = imagens + size_t(inicio) * entradas;
+            for (int q = 4 * threadIdx.x; q < quantas * entradas; q += 4 * threads_treino) {
+                __pipeline_memcpy_async(&bloco_imagens[buf][q], origem + q, 16);
+            }
+            for (int q = threadIdx.x; q < quantas; q += threads_treino) {
+                __pipeline_memcpy_async(&bloco_rotulos[buf][q], rotulos + inicio + q, 4);
+            }
+        }
+        __pipeline_commit();
+    };
+
+    // A cópia do primeiro bloco corre em paralelo com a cópia dos pesos.
+    copiar_bloco(0, 0);
 
     const Parametros p{{w1, b1, ld1}, {w2, b2, ld2}, {w3, b3, ld3}};
     copiar_camada(global.c1, p.c1, entradas, n1);
@@ -315,37 +348,35 @@ __global__ void train_epoch_kernel(Parametros global,
     double perda = 0.0;
 
     for (int k = 0; k < n; ++k) {
-        // Este __syncthreads() fecha a amostra anterior: a atualização da
-        // camada 1 ainda pode estar lendo a imagem anterior no bloco de
-        // imagens, que a cópia abaixo sobrescreve.
-        __syncthreads();
-
-        // A cada amostras_por_bloco amostras, todas as threads copiam o
-        // próximo bloco de imagens e rótulos de uma vez: são 8 192 floats
-        // contíguos, lidos em paralelo e com acesso coalescido. As amostras
-        // seguintes leem a imagem da memória compartilhada, sem esperar a
-        // latência da memória global. A condição é a mesma para todas as
-        // threads, então o __syncthreads() dentro do if é seguro.
         const int pos = k % amostras_por_bloco;
-        if (pos == 0) {
-            const int quantas = min(amostras_por_bloco, n - k);
-            for (int q = threadIdx.x; q < quantas * entradas; q += threads_treino) {
-                bloco_imagens[q] = imagens[size_t(k) * entradas + q];
-            }
-            for (int q = threadIdx.x; q < quantas; q += threads_treino) {
-                bloco_rotulos[q] = rotulos[k + q];
-            }
-            __syncthreads();
-        }
-        const float* x = bloco_imagens + pos * entradas;
+        const int buf = (k / amostras_por_bloco) % 2;
+
+        // No início de cada bloco, cada thread espera as suas cópias desse
+        // bloco, pedidas amostras_por_bloco amostras antes; em geral já
+        // terminaram e a espera é imediata. O __syncthreads() logo abaixo
+        // torna as cópias de todas as threads visíveis ao bloco.
+        if (pos == 0) __pipeline_wait_prior(0);
+
+        // Este __syncthreads() fecha a amostra anterior.
+        __syncthreads();
+        const float* x = bloco_imagens[buf] + pos * entradas;
 
         forward_camada<entradas, n1, 8>(x, p.c1, h1, false);
         __syncthreads();
+
+        // Pede a cópia do próximo bloco para o outro buffer, que fica em
+        // segundo plano enquanto as amostras deste bloco são processadas. A
+        // última leitura do outro buffer (a atualização da camada 1 da
+        // amostra anterior) terminou antes do __syncthreads() do início da
+        // amostra. O pedido vem depois do Forward da camada 1 e não antes:
+        // medido, assim o treino fica 2% mais rápido, e o Forward da camada 1
+        // começa sem esperar o cálculo dos endereços da cópia.
+        if (pos == 0) copiar_bloco(k + amostras_por_bloco, 1 - buf);
         forward_camada<n1, n2, 16>(h1, p.c2, h2, false);
         __syncthreads();
         // Na camada final a saída já é o erro (escore - alvo), que é o delta
         // da camada 3.
-        forward_camada<n2, classes, 16>(h2, p.c3, d3, true, bloco_rotulos[pos]);
+        forward_camada<n2, classes, 16>(h2, p.c3, d3, true, bloco_rotulos[buf][pos]);
         __syncthreads();
 
         // Camada 3: grad_in com os pesos antigos, atualização e delta da
