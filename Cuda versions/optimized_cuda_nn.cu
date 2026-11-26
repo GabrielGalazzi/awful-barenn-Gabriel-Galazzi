@@ -4,9 +4,14 @@
 // kernels (3 no Forward, 1 na perda, 8 no Backward) e o treino era limitado
 // pelo custo fixo de cada lançamento. Aqui uma amostra inteira (Forward das 3
 // camadas, perda e Backward com atualização dos pesos) roda em um único
-// kernel de um bloco. As etapas que antes eram kernels separados são
-// separadas por __syncthreads(), e os valores intermediários (ativações,
-// deltas e gradientes) ficam na memória compartilhada do bloco.
+// bloco. As etapas que antes eram kernels separados são separadas por
+// __syncthreads(), e os valores intermediários (ativações, deltas e
+// gradientes) ficam na memória compartilhada do bloco.
+//
+// Estágio 2: kernel persistente. Um lançamento por época em vez de um por
+// amostra: o bloco percorre todas as amostras sem voltar ao host, com os
+// pesos copiados para a memória compartilhada no início da época e de volta
+// para a memória global no final.
 //
 // A ordem de todas as somas é a mesma da CPU, então a saída continua bit a
 // bit igual à de reusable_buffers_nn.cpp com --fmad=false.
@@ -100,11 +105,14 @@ public:
     void zero() { CUDA_CHECK(cudaMemset(ptr, 0, n * sizeof(T))); }
 };
 
-// Ponteiros de device para os parâmetros de cada camada. Os pesos de uma
-// camada seguem o layout da CPU: linha i (neurônio i) em w + i * entradas.
+// Ponteiros de device para os parâmetros de cada camada. A linha i (pesos
+// do neurônio i) começa em w + i * ld. Na memória global ld = entradas da
+// camada, o layout da CPU; na memória compartilhada as linhas ganham uma
+// posição de folga, ver train_epoch_kernel.
 struct Camada {
     float* w;
     float* b;
+    int ld;
 };
 
 struct Parametros {
@@ -123,7 +131,7 @@ __device__ void forward_camada(const float* in, const Camada& c,
                                int in_features, int out_features, bool final) {
     for (int i = threadIdx.x; i < out_features; i += blockDim.x) {
         float sum = c.b[i];
-        const float* row = c.w + i * in_features;
+        const float* row = c.w + i * c.ld;
         for (int j = 0; j < in_features; ++j) {
             sum += in[j] * row[j];
         }
@@ -140,7 +148,7 @@ __device__ void grad_input_camada(const float* delta, const Camada& c,
     for (int j = threadIdx.x; j < in_features; j += blockDim.x) {
         float acc = 0.0f;
         for (int i = 0; i < out_features; ++i) {
-            acc += delta[i] * c.w[i * in_features + j];
+            acc += delta[i] * c.w[i * c.ld + j];
         }
         grad_in[j] = acc;
     }
@@ -154,7 +162,7 @@ __device__ void update_camada(const Camada& c, const float* delta,
     for (int idx = threadIdx.x; idx < in_features * out_features; idx += blockDim.x) {
         int i = idx / in_features;
         int j = idx % in_features;
-        c.w[idx] -= learning_rate * (delta[i] * last_input[j]);
+        c.w[i * c.ld + j] -= learning_rate * (delta[i] * last_input[j]);
         if (j == 0) c.b[i] -= learning_rate * delta[i];
     }
 }
@@ -167,61 +175,115 @@ __device__ void delta_relu(const float* grad_out, const float* z, float* delta,
     }
 }
 
+// Copia os pesos e vieses de uma camada, convertendo o layout das linhas
+// (ld de origem para ld de destino).
+__device__ void copiar_camada(const Camada& de, const Camada& para,
+                              int in_features, int out_features) {
+    for (int idx = threadIdx.x; idx < in_features * out_features; idx += blockDim.x) {
+        int i = idx / in_features;
+        int j = idx % in_features;
+        para.w[i * para.ld + j] = de.w[i * de.ld + j];
+    }
+    for (int i = threadIdx.x; i < out_features; i += blockDim.x) para.b[i] = de.b[i];
+}
+
 // ---------------------------------------------------------------- kernels --
 
-// Uma amostra de SGD inteira em um bloco. Equivale aos 12 kernels por
-// amostra de cuda_nn.cu, na mesma ordem.
-__global__ void train_step_kernel(Parametros p,
-                                  const float* __restrict__ imagem,
-                                  const int* __restrict__ rotulo,
-                                  float learning_rate,
-                                  double* __restrict__ epoch_loss) {
+// Linhas dos pesos na memória compartilhada. A memória compartilhada tem 32
+// bancos de 4 bytes; no Forward a thread i lê w[i * ld + j]. Com ld = 64 (ou
+// 32, ou 16) todas as threads do warp caem no mesmo banco e a leitura é
+// serializada em até 32 acessos. Com uma posição de folga por linha
+// (ld ímpar), threads vizinhas caem em bancos vizinhos. Compilar com
+// -DFOLGA=0 remove a folga, para medir o efeito dos conflitos de banco.
+#ifndef FOLGA
+#define FOLGA 1
+#endif
+constexpr int ld1 = entradas + FOLGA;
+constexpr int ld2 = n1 + FOLGA;
+constexpr int ld3 = n2 + FOLGA;
+
+// Uma época inteira de SGD em um bloco (kernel persistente). Os pesos são
+// copiados para a memória compartilhada no início, as amostras são
+// processadas em sequência, sem voltar ao host, e os pesos voltam para a
+// memória global no final. Cada amostra executa as mesmas etapas, na mesma
+// ordem, que os 12 kernels por amostra de cuda_nn.cu.
+__global__ void train_epoch_kernel(Parametros global,
+                                   const float* __restrict__ imagens,
+                                   const int* __restrict__ rotulos,
+                                   int n, float learning_rate,
+                                   double* __restrict__ epoch_loss) {
+    __shared__ float w1[n1 * ld1], b1[n1];
+    __shared__ float w2[n2 * ld2], b2[n2];
+    __shared__ float w3[classes * ld3], b3[classes];
     __shared__ float x[entradas];
     __shared__ float z1[n1], h1[n1], z2[n2], h2[n2], escores[classes];
     __shared__ float d3[classes], g3[n2], d2[n2], g2[n1], d1[n1];
 
-    for (int j = threadIdx.x; j < entradas; j += blockDim.x) x[j] = imagem[j];
-    __syncthreads();
+    const Parametros p{{w1, b1, ld1}, {w2, b2, ld2}, {w3, b3, ld3}};
+    copiar_camada(global.c1, p.c1, entradas, n1);
+    copiar_camada(global.c2, p.c2, n1, n2);
+    copiar_camada(global.c3, p.c3, n2, classes);
 
-    forward_camada(x, p.c1, z1, h1, entradas, n1, false);
-    __syncthreads();
-    forward_camada(h1, p.c2, z2, h2, n1, n2, false);
-    __syncthreads();
-    forward_camada(h2, p.c3, nullptr, escores, n2, classes, true);
-    __syncthreads();
+    // Perda acumulada da época; só a thread 0 a usa. Soma as mesmas parcelas,
+    // na mesma ordem, que o total em memória global da versão anterior.
+    double perda = 0.0;
 
-    // Metade do erro quadrático. Uma única thread percorre as 10 classes na
-    // mesma ordem da CPU. Na camada final delta é o próprio gradiente.
-    if (threadIdx.x == 0) {
-        float total = 0.0f;
-        int r = *rotulo;
-        for (int i = 0; i < classes; ++i) {
-            float erro = escores[i] - (i == r ? 1.0f : 0.0f);
-            total += 0.5f * erro * erro;
-            d3[i] = erro;
+    for (int k = 0; k < n; ++k) {
+        // Este __syncthreads() também fecha a amostra anterior: a camada 1
+        // ainda pode estar lendo x quando a próxima imagem chega.
+        __syncthreads();
+        for (int j = threadIdx.x; j < entradas; j += blockDim.x) {
+            x[j] = imagens[size_t(k) * entradas + j];
         }
-        *epoch_loss += total;
+        __syncthreads();
+
+        forward_camada(x, p.c1, z1, h1, entradas, n1, false);
+        __syncthreads();
+        forward_camada(h1, p.c2, z2, h2, n1, n2, false);
+        __syncthreads();
+        forward_camada(h2, p.c3, nullptr, escores, n2, classes, true);
+        __syncthreads();
+
+        // Metade do erro quadrático. Uma única thread percorre as 10 classes
+        // na mesma ordem da CPU. Na camada final delta é o próprio gradiente.
+        if (threadIdx.x == 0) {
+            float total = 0.0f;
+            int r = rotulos[k];
+            for (int i = 0; i < classes; ++i) {
+                float erro = escores[i] - (i == r ? 1.0f : 0.0f);
+                total += 0.5f * erro * erro;
+                d3[i] = erro;
+            }
+            perda += total;
+        }
+        __syncthreads();
+
+        // Camada 3. grad_in usa os pesos antigos, então vem antes da
+        // atualização.
+        grad_input_camada(d3, p.c3, g3, n2, classes);
+        __syncthreads();
+        // A atualização da camada 3 e o delta da camada 2 não dependem um do
+        // outro e rodam na mesma etapa.
+        update_camada(p.c3, d3, h2, learning_rate, n2, classes);
+        delta_relu(g3, z2, d2, n2);
+        __syncthreads();
+
+        // Camada 2.
+        grad_input_camada(d2, p.c2, g2, n1, n2);
+        __syncthreads();
+        update_camada(p.c2, d2, h1, learning_rate, n1, n2);
+        delta_relu(g2, z1, d1, n1);
+        __syncthreads();
+
+        // Camada 1: grad_in não é usado, então não é calculado.
+        update_camada(p.c1, d1, x, learning_rate, entradas, n1);
     }
     __syncthreads();
 
-    // Camada 3. grad_in usa os pesos antigos, então vem antes da atualização.
-    grad_input_camada(d3, p.c3, g3, n2, classes);
-    __syncthreads();
-    // A atualização da camada 3 e o delta da camada 2 não dependem um do
-    // outro e rodam na mesma etapa.
-    update_camada(p.c3, d3, h2, learning_rate, n2, classes);
-    delta_relu(g3, z2, d2, n2);
-    __syncthreads();
-
-    // Camada 2.
-    grad_input_camada(d2, p.c2, g2, n1, n2);
-    __syncthreads();
-    update_camada(p.c2, d2, h1, learning_rate, n1, n2);
-    delta_relu(g2, z1, d1, n1);
-    __syncthreads();
-
-    // Camada 1: grad_in não é usado, então não é calculado.
-    update_camada(p.c1, d1, x, learning_rate, entradas, n1);
+    copiar_camada(p.c1, global.c1, entradas, n1);
+    copiar_camada(p.c2, global.c2, n1, n2);
+    copiar_camada(p.c3, global.c3, n2, classes);
+    if (threadIdx.x == 0) *epoch_loss = perda;
 }
 
 // Forward de todo o conjunto de teste em um lançamento: as imagens são
@@ -264,9 +326,9 @@ public:
 
     Rede() : memoria(tamanho_w1 + n1 + tamanho_w2 + n2 + tamanho_w3 + classes) {
         float* base = memoria.get();
-        p.c1 = {base, base + tamanho_w1};
-        p.c2 = {p.c1.b + n1, p.c1.b + n1 + tamanho_w2};
-        p.c3 = {p.c2.b + n2, p.c2.b + n2 + tamanho_w3};
+        p.c1 = {base, base + tamanho_w1, entradas};
+        p.c2 = {p.c1.b + n1, p.c1.b + n1 + tamanho_w2, n1};
+        p.c3 = {p.c2.b + n2, p.c2.b + n2 + tamanho_w3, n2};
 
         // Vieses começam em zero; os pesos são sobrescritos logo abaixo.
         vector<float> h(memoria.size(), 0.0f);
@@ -486,11 +548,10 @@ int main(int argc, char** argv) {
         const auto inicio = chrono::steady_clock::now();
         for (int epoca = 0; epoca < epocas; ++epoca) {
             double* perda_epoca = d_perdas.get() + epoca;
-            for (size_t k = 0; k < d_treino.n; ++k) {
-                Barenn::train_step_kernel<<<1, Barenn::threads_treino>>>(
-                    rede.p, d_treino.imagem(k), d_treino.rotulo(k), taxa, perda_epoca);
-                CUDA_CHECK_KERNEL();
-            }
+            Barenn::train_epoch_kernel<<<1, Barenn::threads_treino>>>(
+                rede.p, d_treino.imagens.get(), d_treino.rotulos.get(),
+                static_cast<int>(d_treino.n), taxa, perda_epoca);
+            CUDA_CHECK_KERNEL();
         }
         // Os lançamentos são assíncronos: sem sincronizar, o cronômetro
         // pararia antes de a GPU terminar o trabalho.
