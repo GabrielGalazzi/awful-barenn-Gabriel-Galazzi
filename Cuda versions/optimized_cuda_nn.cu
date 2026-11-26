@@ -17,14 +17,21 @@
 // recebe as dimensões da camada como parâmetros de template, e o laço
 // sobre os pesos de cada thread é desenrolado.
 //
-// A ordem de todas as somas é a mesma da CPU, então a saída continua bit a
-// bit igual à de reusable_buffers_nn.cpp com --fmad=false.
+// Estágio 4: redução em árvore com shuffle. Cada produto escalar do Forward
+// e do grad_in é dividido entre várias threads de um warp, e as parciais
+// são somadas com __shfl_xor_sync.
+//
+// Até o estágio 3 a ordem de todas as somas era a da CPU e a saída era bit a
+// bit igual à de reusable_buffers_nn.cpp com --fmad=false. A redução em
+// árvore soma as mesmas parcelas em outra ordem; em ponto flutuante isso
+// muda o arredondamento, então os últimos dígitos da perda e algumas
+// previsões de teste podem diferir da CPU, como acontece com a FMA.
 //
 // Compilação (RTX 4070 Laptop = sm_89):
 //   nvcc -O3 -std=c++17 -arch=sm_89 --fmad=false optimized_cuda_nn.cu -o optimized_cuda_nn
-// --fmad=false impede que a*b+c vire uma FMA (um único arredondamento), o que
-// mantém a saída bit a bit igual à da CPU. Sem a flag o resultado continua
-// correto, mas os últimos dígitos da perda podem mudar.
+// --fmad=false impede que a*b+c vire uma FMA (um único arredondamento). Desde
+// o estágio 4 a saída já não é bit a bit igual à da CPU; a flag continua
+// para que a única diferença em relação à CPU seja a ordem das somas.
 
 #include <algorithm>
 #include <array>
@@ -69,12 +76,10 @@ constexpr int n1 = 32;
 constexpr int n2 = 16;
 constexpr int classes = 10;
 
-// Threads do bloco que treina uma amostra. A etapa mais larga é a
-// atualização dos 2048 pesos da camada 1: 8 pesos por thread.
+// Threads de cada bloco, no treino e na avaliação. A etapa mais larga é a
+// atualização dos 2048 pesos da camada 1: 8 pesos por thread. Os produtos
+// escalares da camada 1 usam 32 neurônios x 8 threads = 256 threads.
 constexpr int threads_treino = 256;
-// Na avaliação cada bloco faz o Forward de uma imagem; a camada mais larga
-// tem 32 neurônios, então um warp basta.
-constexpr int threads_avaliacao = 32;
 
 // Buffer na memória da GPU. O destrutor libera a memória, inclusive quando
 // uma exceção interrompe o programa, então todo cudaMalloc tem seu cudaFree.
@@ -124,37 +129,75 @@ struct Parametros {
 };
 
 // ------------------------------------------------- etapas de uma camada --
-// Cada função é executada por todas as threads do bloco, que dividem o
-// trabalho em passos de blockDim.x. Nenhuma sincroniza: quem chama coloca
+// Cada função é executada por todas as threads_treino threads do bloco, que
+// dividem o trabalho entre si. Nenhuma sincroniza o bloco: quem chama coloca
 // __syncthreads() entre etapas que dependem uma da outra.
 
-// z = viés + produto escalar da linha i com a entrada; uma thread por
-// neurônio. A ordem da soma (j crescente, começando pelo viés) é a da CPU.
+// Os produtos escalares são divididos entre S threads vizinhas de um mesmo
+// warp: cada uma soma um trecho contíguo dos termos e as S parciais são
+// combinadas em árvore com __shfl_xor_sync, que troca registradores entre
+// threads do warp sem passar pela memória compartilhada. Na camada 1 a
+// cadeia de somas dependentes de cada neurônio cai de 64 parcelas para 8
+// parcelas mais 3 níveis de shuffle. Em troca, a ordem das somas deixa de
+// ser a da CPU (ver o cabeçalho).
+//
+// Cada grupo de S threads precisa estar dentro de um warp e todas as threads
+// de um warp que entra no shuffle precisam participar dele: S divide 32 e o
+// número de threads usadas (OUT * S ou IN * S) é múltiplo de 32.
+
+// z = viés + produto escalar da linha i com a entrada. As threads
+// i * S .. i * S + S - 1 calculam o neurônio i; a primeira delas escreve o
+// resultado.
+template <int IN, int OUT, int S>
 __device__ void forward_camada(const float* in, const Camada& c,
-                               float* z, float* out,
-                               int in_features, int out_features, bool final) {
-    for (int i = threadIdx.x; i < out_features; i += blockDim.x) {
-        float sum = c.b[i];
-        const float* row = c.w + i * c.ld;
-        for (int j = 0; j < in_features; ++j) {
-            sum += in[j] * row[j];
+                               float* z, float* out, bool final) {
+    static_assert(32 % S == 0 && IN % S == 0 && (OUT * S) % 32 == 0 &&
+                  OUT * S <= threads_treino, "divisão inválida");
+    const int i = threadIdx.x / S;
+    const int parte = threadIdx.x % S;
+    if (i < OUT) {
+        constexpr int trecho = IN / S;
+        const float* row = c.w + i * c.ld + parte * trecho;
+        const float* x = in + parte * trecho;
+        float sum = 0.0f;
+#pragma unroll
+        for (int m = 0; m < trecho; ++m) sum += x[m] * row[m];
+#pragma unroll
+        for (int salto = S / 2; salto > 0; salto /= 2) {
+            sum += __shfl_xor_sync(0xffffffffu, sum, salto);
         }
-        if (z) z[i] = sum;
-        // Mesma semântica de max(0.0f, sum) na CPU.
-        out[i] = final ? sum : (0.0f < sum ? sum : 0.0f);
+        if (parte == 0) {
+            sum = c.b[i] + sum;
+            if (z) z[i] = sum;
+            // Mesma semântica de max(0.0f, sum) na CPU.
+            out[i] = final ? sum : (0.0f < sum ? sum : 0.0f);
+        }
     }
 }
 
-// grad_in[j] = soma, em i crescente, de delta[i] * W[i][j]; uma thread por
-// entrada. Precisa rodar antes da atualização dos pesos da mesma camada.
-__device__ void grad_input_camada(const float* delta, const Camada& c,
-                                  float* grad_in, int in_features, int out_features) {
-    for (int j = threadIdx.x; j < in_features; j += blockDim.x) {
+// grad_in[j] = soma de delta[i] * W[i][j] sobre os neurônios i. As threads
+// j * S .. j * S + S - 1 calculam a entrada j, cada uma sobre OUT / S
+// neurônios (arredondado para cima). Precisa rodar antes da atualização dos
+// pesos da mesma camada.
+template <int IN, int OUT, int S>
+__device__ void grad_input_camada(const float* delta, const Camada& c, float* grad_in) {
+    static_assert(32 % S == 0 && (IN * S) % 32 == 0 && IN * S <= threads_treino,
+                  "divisão inválida");
+    const int j = threadIdx.x / S;
+    const int parte = threadIdx.x % S;
+    if (j < IN) {
+        constexpr int trecho = (OUT + S - 1) / S;
         float acc = 0.0f;
-        for (int i = 0; i < out_features; ++i) {
-            acc += delta[i] * c.w[i * c.ld + j];
+#pragma unroll
+        for (int m = 0; m < trecho; ++m) {
+            const int i = parte * trecho + m;
+            if (OUT % S == 0 || i < OUT) acc += delta[i] * c.w[i * c.ld + j];
         }
-        grad_in[j] = acc;
+#pragma unroll
+        for (int salto = S / 2; salto > 0; salto /= 2) {
+            acc += __shfl_xor_sync(0xffffffffu, acc, salto);
+        }
+        if (parte == 0) grad_in[j] = acc;
     }
 }
 
@@ -249,11 +292,11 @@ __global__ void train_epoch_kernel(Parametros global,
         }
         __syncthreads();
 
-        forward_camada(x, p.c1, z1, h1, entradas, n1, false);
+        forward_camada<entradas, n1, 8>(x, p.c1, z1, h1, false);
         __syncthreads();
-        forward_camada(h1, p.c2, z2, h2, n1, n2, false);
+        forward_camada<n1, n2, 16>(h1, p.c2, z2, h2, false);
         __syncthreads();
-        forward_camada(h2, p.c3, nullptr, escores, n2, classes, true);
+        forward_camada<n2, classes, 16>(h2, p.c3, nullptr, escores, true);
         __syncthreads();
 
         // Metade do erro quadrático. Uma única thread percorre as 10 classes
@@ -272,7 +315,7 @@ __global__ void train_epoch_kernel(Parametros global,
 
         // Camada 3. grad_in usa os pesos antigos, então vem antes da
         // atualização.
-        grad_input_camada(d3, p.c3, g3, n2, classes);
+        grad_input_camada<n2, classes, 2>(d3, p.c3, g3);
         __syncthreads();
         // A atualização da camada 3 e o delta da camada 2 não dependem um do
         // outro e rodam na mesma etapa.
@@ -281,7 +324,7 @@ __global__ void train_epoch_kernel(Parametros global,
         __syncthreads();
 
         // Camada 2.
-        grad_input_camada(d2, p.c2, g2, n1, n2);
+        grad_input_camada<n1, n2, 8>(d2, p.c2, g2);
         __syncthreads();
         update_camada<n1, n2>(p.c2, d2, h1, learning_rate);
         delta_relu(g2, z1, d1, n1);
@@ -308,12 +351,12 @@ __global__ void inference_kernel(Parametros p,
 
     for (int j = threadIdx.x; j < entradas; j += blockDim.x) x[j] = imagem[j];
     __syncthreads();
-    forward_camada(x, p.c1, nullptr, h1, entradas, n1, false);
+    forward_camada<entradas, n1, 8>(x, p.c1, nullptr, h1, false);
     __syncthreads();
-    forward_camada(h1, p.c2, nullptr, h2, n1, n2, false);
+    forward_camada<n1, n2, 16>(h1, p.c2, nullptr, h2, false);
     __syncthreads();
-    forward_camada(h2, p.c3, nullptr, escores + size_t(blockIdx.x) * classes,
-                   n2, classes, true);
+    forward_camada<n2, classes, 16>(h2, p.c3, nullptr,
+                                    escores + size_t(blockIdx.x) * classes, true);
 }
 
 // ------------------------------------------------------------------- rede --
@@ -442,7 +485,7 @@ void avaliar(const Rede& rede, const vector<Amostra>& teste, const DeviceDataset
     // Escores de todo o teste em [n x 10], calculados em um lançamento e
     // copiados para o host de uma vez.
     DeviceBuffer<float> d_escores(teste.size() * classes);
-    inference_kernel<<<static_cast<unsigned>(d_teste.n), threads_avaliacao>>>(
+    inference_kernel<<<static_cast<unsigned>(d_teste.n), threads_treino>>>(
         rede.p, d_teste.imagens.get(), d_escores.get());
     CUDA_CHECK_KERNEL();
     vector<float> todos_escores(d_escores.size());
