@@ -21,6 +21,10 @@
 // e do grad_in é dividido entre várias threads de um warp, e as parciais
 // são somadas com __shfl_xor_sync.
 //
+// Estágio 5: imagens em blocos na memória compartilhada. O treino copia 128
+// imagens e seus rótulos de uma vez para a memória compartilhada, em vez de
+// ler uma imagem da memória global no início de cada amostra.
+//
 // Até o estágio 3 a ordem de todas as somas era a da CPU e a saída era bit a
 // bit igual à de reusable_buffers_nn.cpp com --fmad=false. A redução em
 // árvore soma as mesmas parcelas em outra ordem; em ponto flutuante isso
@@ -80,6 +84,9 @@ constexpr int classes = 10;
 // atualização dos 2048 pesos da camada 1: 8 pesos por thread. Os produtos
 // escalares da camada 1 usam 32 neurônios x 8 threads = 256 threads.
 constexpr int threads_treino = 256;
+// Imagens carregadas de uma vez da memória global para a memória
+// compartilhada no treino (128 x 64 floats = 32 KB).
+constexpr int amostras_por_bloco = 128;
 
 // Buffer na memória da GPU. O destrutor libera a memória, inclusive quando
 // uma exceção interrompe o programa, então todo cudaMalloc tem seu cudaFree.
@@ -270,7 +277,9 @@ __global__ void train_epoch_kernel(Parametros global,
     __shared__ float w1[n1 * ld1], b1[n1];
     __shared__ float w2[n2 * ld2], b2[n2];
     __shared__ float w3[classes * ld3], b3[classes];
-    __shared__ float x[entradas];
+    // Bloco de imagens e rótulos copiado da memória global (32.5 KB).
+    __shared__ float bloco_imagens[amostras_por_bloco * entradas];
+    __shared__ int bloco_rotulos[amostras_por_bloco];
     __shared__ float z1[n1], h1[n1], z2[n2], h2[n2], escores[classes];
     __shared__ float d3[classes], g3[n2], d2[n2], g2[n1], d1[n1];
 
@@ -284,13 +293,29 @@ __global__ void train_epoch_kernel(Parametros global,
     double perda = 0.0;
 
     for (int k = 0; k < n; ++k) {
-        // Este __syncthreads() também fecha a amostra anterior: a camada 1
-        // ainda pode estar lendo x quando a próxima imagem chega.
+        // Este __syncthreads() fecha a amostra anterior: a atualização da
+        // camada 1 ainda pode estar lendo a imagem anterior no bloco de
+        // imagens, que a cópia abaixo sobrescreve.
         __syncthreads();
-        for (int j = threadIdx.x; j < entradas; j += blockDim.x) {
-            x[j] = imagens[size_t(k) * entradas + j];
+
+        // A cada amostras_por_bloco amostras, todas as threads copiam o
+        // próximo bloco de imagens e rótulos de uma vez: são 8 192 floats
+        // contíguos, lidos em paralelo e com acesso coalescido. As amostras
+        // seguintes leem a imagem da memória compartilhada, sem esperar a
+        // latência da memória global. A condição é a mesma para todas as
+        // threads, então o __syncthreads() dentro do if é seguro.
+        const int pos = k % amostras_por_bloco;
+        if (pos == 0) {
+            const int quantas = min(amostras_por_bloco, n - k);
+            for (int q = threadIdx.x; q < quantas * entradas; q += threads_treino) {
+                bloco_imagens[q] = imagens[size_t(k) * entradas + q];
+            }
+            for (int q = threadIdx.x; q < quantas; q += threads_treino) {
+                bloco_rotulos[q] = rotulos[k + q];
+            }
+            __syncthreads();
         }
-        __syncthreads();
+        const float* x = bloco_imagens + pos * entradas;
 
         forward_camada<entradas, n1, 8>(x, p.c1, z1, h1, false);
         __syncthreads();
@@ -303,7 +328,7 @@ __global__ void train_epoch_kernel(Parametros global,
         // na mesma ordem da CPU. Na camada final delta é o próprio gradiente.
         if (threadIdx.x == 0) {
             float total = 0.0f;
-            int r = rotulos[k];
+            int r = bloco_rotulos[pos];
             for (int i = 0; i < classes; ++i) {
                 float erro = escores[i] - (i == r ? 1.0f : 0.0f);
                 total += 0.5f * erro * erro;
