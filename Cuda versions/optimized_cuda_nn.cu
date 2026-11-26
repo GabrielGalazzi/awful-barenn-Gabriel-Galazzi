@@ -13,6 +13,10 @@
 // pesos copiados para a memória compartilhada no início da época e de volta
 // para a memória global no final.
 //
+// Estágio 3: dimensões em tempo de compilação. A atualização dos pesos
+// recebe as dimensões da camada como parâmetros de template, e o laço
+// sobre os pesos de cada thread é desenrolado.
+//
 // A ordem de todas as somas é a mesma da CPU, então a saída continua bit a
 // bit igual à de reusable_buffers_nn.cpp com --fmad=false.
 //
@@ -155,15 +159,23 @@ __device__ void grad_input_camada(const float* delta, const Camada& c,
 }
 
 // Uma iteração por peso. A thread que atualiza o peso j = 0 de cada linha
-// também atualiza o viés.
+// também atualiza o viés. As dimensões da camada e o número de threads são
+// constantes de compilação: o laço tem número fixo de iterações (8 na
+// camada 1) e é desenrolado, então as leituras de todas as iterações são
+// emitidas juntas em vez de cada iteração esperar a latência da anterior.
+template <int IN, int OUT>
 __device__ void update_camada(const Camada& c, const float* delta,
-                              const float* last_input, float learning_rate,
-                              int in_features, int out_features) {
-    for (int idx = threadIdx.x; idx < in_features * out_features; idx += blockDim.x) {
-        int i = idx / in_features;
-        int j = idx % in_features;
-        c.w[i * c.ld + j] -= learning_rate * (delta[i] * last_input[j]);
-        if (j == 0) c.b[i] -= learning_rate * delta[i];
+                              const float* last_input, float learning_rate) {
+    constexpr int total = IN * OUT;
+#pragma unroll
+    for (int base = 0; base < total; base += threads_treino) {
+        int idx = base + threadIdx.x;
+        if (total % threads_treino == 0 || idx < total) {
+            int i = idx / IN;
+            int j = idx % IN;
+            c.w[i * c.ld + j] -= learning_rate * (delta[i] * last_input[j]);
+            if (j == 0) c.b[i] -= learning_rate * delta[i];
+        }
     }
 }
 
@@ -264,19 +276,19 @@ __global__ void train_epoch_kernel(Parametros global,
         __syncthreads();
         // A atualização da camada 3 e o delta da camada 2 não dependem um do
         // outro e rodam na mesma etapa.
-        update_camada(p.c3, d3, h2, learning_rate, n2, classes);
+        update_camada<n2, classes>(p.c3, d3, h2, learning_rate);
         delta_relu(g3, z2, d2, n2);
         __syncthreads();
 
         // Camada 2.
         grad_input_camada(d2, p.c2, g2, n1, n2);
         __syncthreads();
-        update_camada(p.c2, d2, h1, learning_rate, n1, n2);
+        update_camada<n1, n2>(p.c2, d2, h1, learning_rate);
         delta_relu(g2, z1, d1, n1);
         __syncthreads();
 
         // Camada 1: grad_in não é usado, então não é calculado.
-        update_camada(p.c1, d1, x, learning_rate, entradas, n1);
+        update_camada<entradas, n1>(p.c1, d1, x, learning_rate);
     }
     __syncthreads();
 
