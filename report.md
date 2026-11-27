@@ -84,8 +84,8 @@ A regra de ouro, imposta pelo enunciado, foi tratada com rigor desde o início: 
 - **Rodadas intercaladas:** em cada rodada, todas as versões rodam uma vez, em ordem sorteada, depois de um aquecimento não registrado. Assim, aquecimento térmico e carga de fundo atingem todas as versões por igual. No notebook usei de 10 a 100 rodadas por comparação, com o processo fixo num P-core (`taskset`); nos clusters, nós exclusivos e de 6 a 40 rodadas.
 - **Estatística:** mediana, desvio padrão, diferença pareada com intervalo de confiança de 95% (bootstrap) e teste do sinal quando a diferença era pequena.
 - **Corretude:** hash SHA-256 da saída inteira, sem as linhas de tempo. A referência (`d6046538f58a`) é a mesma no notebook, no Santos Dumont e no Franky, e as saídas CUDA são idênticas entre `sm_70`, `sm_86` e `sm_89`. Nas versões CUDA, também `compute-sanitizer` (`memcheck`, `racecheck`, `synccheck`).
-- **Profilers:** callgrind/KCachegrind (com simulação de cache ajustada ao P-core), `perf stat`/`perf annotate` (Santos Dumont), contadores próprios via `perf_event_open` (Franky, onde não há `perf`), `strace`, `-fopt-info-vec`, assembly, Nsight Systems, `cuobjdump`/`ptxas -v` e cronometragem dentro do kernel com `clock64()`.
-- **Uma limitação que acompanhou todo o projeto:** o Nsight Compute (`ncu`) retornou `ERR_NVGPUCTRPERM` nas três máquinas com GPU, porque os contadores de desempenho da GPU são restritos a administradores. A ocupação alcançada e os conflitos de banco nunca puderam ser medidos diretamente; foram calculados (`ptxas`, configuração de lançamento) e confirmados por ablação e contagem de ciclos.
+- **Profilers:** callgrind/KCachegrind (com simulação de cache ajustada ao P-core), `perf stat`/`perf annotate` (Santos Dumont), contadores próprios via `perf_event_open` (Franky, onde não há `perf`), `strace`, `-fopt-info-vec`, assembly, Nsight Systems, Nsight Compute, `cuobjdump`/`ptxas -v` e cronometragem dentro do kernel com `clock64()`.
+- **Uma limitação que acompanhou quase todo o projeto:** o Nsight Compute (`ncu`) retornou `ERR_NVGPUCTRPERM` nas três máquinas com GPU, porque os contadores de desempenho da GPU são restritos a administradores (`RmProfilingAdminOnly: 1`). Durante os blocos, a ocupação e os conflitos de banco foram calculados (`ptxas`, configuração de lançamento) e localizados por ablação e contagem de ciclos. No fim, o `ncu` foi executado com `sudo` no notebook (Nsight Compute 2026.1.1, `--set full`) sobre `v2.0`, `v2.1` e `v2.2`, e as medidas diretas (ocupação alcançada, motivos de espera dos warps, conflitos de banco) confirmaram os cálculos; elas estão nas Etapas 4, 5 e 6. No Santos Dumont e no Franky ele continua bloqueado.
 - **`-Ofast` e `--use_fast_math` ficaram fora** das comparações oficiais: eles mudam a saída (1 716 acertos em vez de 1 717 no legado).
 
 ---
@@ -106,6 +106,7 @@ Horários de Brasília, tirados das Issues, PRs e commits.
 | 26/11, 11:32 → 12:07 | Kernel persistente, memória compartilhada, *shuffles* | [#13](https://github.com/GabrielGalazzi/awful-barenn-Gabriel-Galazzi/issues/13), PR #14 | `v2.1-CUDA-Otimizado` |
 | 26/11, 14:22 → 14:48 | *Pipelining* dentro do kernel | [#15](https://github.com/GabrielGalazzi/awful-barenn-Gabriel-Galazzi/issues/15), PR #16 | `v2.2-CUDA-Pipelining` |
 | 26/11, tarde e noite | Todos os commits reexecutados no Santos Dumont e no Franky; resultados anexados às Issues | #1 a #15 | – |
+| 27/11 | Nsight Compute com `sudo` sobre `v2.0`, `v2.1` e `v2.2`; ocupação real e motivos de espera anexados às Issues | #11, #13, #15 | – |
 
 Cada bloco seguiu o mesmo ciclo: perfil → hipótese escrita na Issue antes do código → commits isolados → validação da saída → medição repetida → fechamento com evidências e tag. O espaçamento entre 15/11 e 25/11 marca a virada da fase de CPU para a de paralelismo e GPU.
 
@@ -298,10 +299,27 @@ A previsão escrita na Issue foi "da ordem de 5 s, ~20x a CPU".
 ### Diagnóstico
 
 - **Latência de lançamento, não cálculo.** A thread da CPU passa 86.6% do tempo em `cudaLaunchKernel`; até o `delta_kernel`, que faz uma multiplicação por thread, leva 1.1 µs. Esse tempo é custo fixo.
-- **GPU quase vazia.** O maior lançamento tem 64 warps, de 1 728 possíveis (3.7%). A ocupação teórica por SM seria 100%; faltam blocos, não recursos.
+- **GPU quase vazia.** O maior lançamento tem 64 warps, de 1 728 possíveis (3.7%). Faltam blocos, não recursos (a ocupação medida está logo abaixo).
 - **Roofline:** 0.74 GFLOP/s, menos de 0.01% do pico da GPU. O porte está abaixo de qualquer teto do roofline.
 - **PCIe irrelevante:** o upload inteiro leva 0.8 ms (0.02% do treino). Memória *pinned* ou *streams* não teriam efeito.
 - **FMA** muda a acurácia em uma imagem e ganha só 0.5%. A build de referência ficou com `--fmad=false`.
+
+### O que o Nsight Compute mediu
+
+Os 12 kernels de uma amostra, perfilados com `sudo ncu --set full`. O `ncu` trava o SM no clock base e esvazia os caches antes de cada kernel, então as durações ficam maiores que as do Nsight Systems (32.4 µs somados, contra 20.3 µs por amostra sem profiler); o que importa são as proporções.
+
+![Nsight Compute: os 12 kernels de uma amostra no porte funcional](report_assets/i11_ncu_v2.0_resumo.jpg)
+
+| Kernel (grade × bloco) | Ocupação teórica | Ocupação alcançada | Ciclos por instrução emitida | Espera por memória global (`long_scoreboard`) |
+|:---|---:|---:|---:|---:|
+| `forward_kernel`, camada 1 (1 × 32) | 50% | 2.1% | 21.8 | 15.2 |
+| `delta_kernel` (1 × 32) | 50% | 1.9 a 2.1% | 63 a 64 | 21.4 a 22.5 |
+| `grad_input_kernel` (1 × 32) | 50% | 2.2% | 23.4 a 29.5 | 9.1 a 16.1 |
+| `update_kernel` (1, 2 e 8 × 256) | 100% | 12.8 a 16.9% | 36.9 a 41.0 | 15.6 a 19.3 |
+
+- **A ocupação teórica de 100% só vale para os kernels de 256 threads.** Nos de um warp por bloco, o limite de 24 blocos por SM do Ada deixa no máximo 24 de 48 warps (50%). A alcançada é de ~2%: um warp no único SM que recebe o bloco.
+- **Cada kernel passa a maior parte do tempo esperando a memória global.** Um warp emite uma instrução a cada 17 a 64 ciclos, e a maior parcela é `long_scoreboard`: cada kernel começa lendo da memória global o que o anterior escreveu.
+- **O acesso não coalescido ficou medido:** no `forward_kernel` da camada 1, 16.4 setores de 32 B por requisição (2 116 em 129), contra 4 de um acesso coalescido. É a média entre `x[j]`, igual para o warp inteiro (1 setor), e `W[i][j]`, com passo de uma linha por thread (32 setores).
 
 ### Uma GPU de datacenter não resolve um gargalo de lançamento
 
@@ -357,10 +375,30 @@ Depois, 51 kernels `train_epoch_kernel` encostados um no outro e a CPU numa úni
 
 ### Onde ficou o tempo
 
-Uma ablação (retirar uma etapa por vez) substituiu o `ncu` bloqueado: a atualização dos pesos responde por ~39% do tempo, o `Forward` por ~33%, e só as 11 barreiras por amostra já custam 0.033 s (~12%).
+Com o `ncu` bloqueado durante o bloco, uma ablação (retirar uma etapa por vez) localizou o caminho crítico: a atualização dos pesos responde por ~39% do tempo, o `Forward` por ~33%, e só as 11 barreiras por amostra já custam 0.033 s (~12%).
 
 - **Roofline:** 11.1 GFLOP/s, 2.2% do pico de **um** SM. Cada amostra traz da memória global só 260 B. O limite é a **latência** de uma cadeia de etapas dependentes executada por um bloco.
 - **Amdahl:** a sequência de amostras é serial; usar os 36 SMs exigiria minilotes, que mudam a saída.
+
+### O que o Nsight Compute confirmou
+
+Perfil de uma época da `v2.1` com `sudo ncu --set full`, com o SM travado em 1.98 GHz.
+
+![Nsight Compute: resumo do train_epoch_kernel da v2.1](report_assets/i13_ncu_v2.1_resumo.jpg)
+
+| Métrica (`train_epoch_kernel`, uma época) | `v2.1` |
+|:---|---:|
+| Ciclos do SM por época | 13.32 M (3 483 por amostra) |
+| Registradores / memória compartilhada por bloco | 70 / 45 472 B |
+| Ocupação teórica (limitada pela memória compartilhada, 2 blocos por SM) | 33.3% (16 de 48 warps) |
+| **Ocupação alcançada** | **16.7% (8 warps: o único bloco)** |
+| Ciclos ativos por SM, média dos 36 SMs | 369 856 (= 13.32 M ÷ 36) |
+| Warps parados por instrução emitida: `short_scoreboard` / barreira / `wait` / `long_scoreboard` | 3.92 / 2.60 / 1.79 / 0.13 |
+
+- **A ocupação calculada estava certa.** Teórica de 33.3% e alcançada de 16.7%, exatamente os 8 warps do único bloco. A média de ciclos ativos por SM é 1/36 dos ciclos do kernel: só um SM trabalha.
+- **Os 13.32 M ciclos batem com o `clock64`** usado na Etapa 6 (13.2 a 13.7 M por época).
+- **O gargalo mudou de lugar.** No porte funcional dominava a espera pela memória global (`long_scoreboard` de 5 a 22); aqui ela cai para 0.13. Dominam agora `short_scoreboard` (resultado de um acesso à memória compartilhada ou de um *shuffle*) e a barreira: a latência da cadeia de etapas dentro do SM, que a ablação havia apontado.
+- **Conflitos de banco medidos:** as leituras de 4 bytes da memória compartilhada geram 21% de *wavefronts* acima do ideal (363 mil por época). A maior parte vem do conflito de 2 vias no `Forward` da camada 1, que a Etapa 6 corrige: com as leituras em `float4` alternado, o excesso cai para 99 mil.
 
 ### Reprodução nas GPUs de datacenter
 
@@ -412,6 +450,35 @@ Encurtar a cadeia de cada amostra **sem mudar nenhuma conta**: mesmas operaçõe
 - **`float4` com ordem alternada:** separando os efeitos, a leitura vetorizada vale ~2.4% e eliminar o conflito de banco de 2 vias vale mais ~6%.
 
 O kernel passou de 70 para 54 registradores por thread, e a GPU subiu de 11.1 para 18.3 GFLOP/s (a CPU faz 13.8).
+
+### `v2.1` × `v2.2` no Nsight Compute
+
+Uma época de cada versão com `sudo ncu --set full`, SM travado em 1.98 GHz:
+
+| Métrica (`train_epoch_kernel`, uma época) | `v2.1` | `v2.2` | Variação |
+|:---|---:|---:|---:|
+| Ciclos do SM por época | 13.32 M | 8.04 M | −40% |
+| Instruções executadas (por warp) | 9.97 M | 7.78 M | −22% |
+| Ciclos por instrução emitida, por warp | 10.49 | 8.25 | −21% |
+| Warps elegíveis por escalonador | 0.20 | 0.30 | +50% |
+| Espera `short_scoreboard` (memória compartilhada, *shuffle*) | 3.92 | 2.89 | −26% |
+| Espera em barreira (`__syncthreads`) | 2.60 | 2.07 | −20% |
+| Espera `long_scoreboard` (memória global) | 0.13 | 0.02 | |
+| *Wavefronts* da memória compartilhada | 3.52 M | 2.21 M | −37% |
+| *Wavefronts* em excesso por conflito de banco | 627 mil | 424 mil | −32% |
+| Eficiência de desvio | 89.7% | 99.3% | |
+| Ocupação teórica / alcançada | 33.3% / 16.7% | 33.3% / 16.7% | |
+
+![Nsight Compute: GPU Speed of Light, Compute Workload e Scheduler Statistics da v2.2](report_assets/i15_ncu_v2.2_speed_of_light.jpg)
+
+![Nsight Compute: Launch Statistics e Occupancy da v2.2](report_assets/i15_ncu_v2.2_ocupacao.jpg)
+
+![Nsight Compute: Warp State Statistics da v2.2](report_assets/i15_ncu_v2.2_warp_state.jpg)
+
+- **Os ciclos confirmam o `clock64`:** 8.04 M por época no `ncu`, contra 8.26 M medidos dentro do kernel; ~2 100 ciclos por amostra.
+- **O ganho veio de encurtar as esperas, não de mais paralelismo.** A ocupação é a mesma (um bloco de 8 warps num SM; os ciclos ativos médios por SM, 223 170, são 8.04 M ÷ 36). O que muda é quanto trabalho esses warps fazem por ciclo: uma instrução a cada 8.25 ciclos (eram 10.49), com menos espera pela memória compartilhada (−26%) e pelas barreiras (−20%, de 11 para 5 por amostra).
+- **As leituras `float4` em ordem alternada não têm conflito:** 741 662 *wavefronts* nas leituras `LDS.128`, todas ideais.
+- **O que o `ncu` ainda aponta:** as escritas `STS.128` dos pesos novos da camada 1 levam 4 *wavefronts* por instrução, como as leituras, mas o `ncu` considera 2 o ideal para escritas e conta 64 *wavefronts* de excesso por amostra. Mesmo no caminho crítico, isso valeria no máximo ~3% dos ~2 100 ciclos. As regras *Small Grid* e *Issue Slot Utilization* pedem mais warps por SM, ou seja, minilotes, que mudam a saída.
 
 ### A versão final é limitada pelo clock de um SM
 
@@ -471,7 +538,7 @@ O que a reprodução mostrou:
 
 - Um modelo de ~11 KB vive inteiro na L1, então otimizar layout de memória rendeu pouco, e o que rendeu foi deixar o compilador vetorizar. O roofline colocou o código, desde o início, do lado limitado por cálculo.
 - O paralelismo em CPU foi derrotado pela Lei de Amdahl *com custo de sincronização*: barreiras de 0.1 a 1.7 µs contra 0.15 µs de trabalho. Os contadores de coerência (HITM) e o `futex` por barreira mostraram o mecanismo.
-- Na GPU, o gargalo mudou de lugar três vezes, e cada mudança foi medida: primeiro a latência de lançamento (o tempo seguia o clock da CPU); depois a cadeia de etapas dentro de um SM (o tempo seguia o clock do SM); e no fim um número fixo de ciclos por época, igual em três arquiteturas.
+- Na GPU, o gargalo mudou de lugar três vezes, e cada mudança foi medida: primeiro a latência de lançamento (o tempo seguia o clock da CPU); depois a cadeia de etapas dentro de um SM (o tempo seguia o clock do SM); e no fim um número fixo de ciclos por época, igual em três arquiteturas. O Nsight Compute mostrou a mesma história nos motivos de espera dos warps: no porte funcional dominava a espera pela memória global (`long_scoreboard`); no kernel persistente, a espera pela memória compartilhada e pelas barreiras, que o *pipelining* reduziu em 20% a 26%. A ocupação alcançada (2% no porte, 16.7% depois, sempre um bloco) bateu com o calculado.
 - O PCIe nunca foi o gargalo: os dados sobem uma vez (0.8 ms) e nada trafega durante o treino.
 
 **Sobre as decisões de engenharia.**
